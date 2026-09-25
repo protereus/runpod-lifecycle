@@ -59,7 +59,7 @@ class Pod:
                 current_state = PodState.PROVISIONING
                 await _emit_state(self.hooks, self.id, PodState.PROVISIONING, {"status": status or {}})
 
-            if desired_status in {"FAILED", "TERMINATED"}:
+            if desired_status in {"FAILED", "ERROR", "TERMINATED"}:
                 failed_state = PodState.TERMINATED if desired_status == "TERMINATED" else PodState.FAILED
                 await _emit_state(self.hooks, self.id, failed_state, {"status": status or {}})
                 raise LaunchFailure(f"Pod {self.id} entered terminal state {desired_status}")
