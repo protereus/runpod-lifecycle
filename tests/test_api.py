@@ -338,6 +338,12 @@ def test_terminate_pod_sends_delete(runpod_api) -> None:
     assert [c.method for c in runpod_api.calls] == ["DELETE"]
 
 
+def test_terminate_pod_treats_404_as_already_terminated(runpod_api) -> None:
+    runpod_api.add("DELETE", "/pods/p1", problem(404, "pod not found", "Not Found"))
+
+    api.terminate_pod("p1", "k")
+
+
 # ---------------------------------------------------------------------------
 # GPU catalogue
 # ---------------------------------------------------------------------------

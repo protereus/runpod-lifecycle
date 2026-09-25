@@ -597,8 +597,17 @@ def get_pod_ssh_details(pod_id: str, api_key: str) -> dict[str, Any] | None:
 
 
 def terminate_pod(pod_id: str, api_key: str) -> None:
-    """Terminate a RunPod pod to stop billing."""
-    _request("DELETE", f"/pods/{pod_id}", api_key)
+    """Terminate a RunPod pod to stop billing.
+
+    A 404 means the pod is already gone. ``GET /v2/pods`` can still list a
+    pod for a few seconds after its DELETE, so repeat terminates are expected.
+    """
+    try:
+        _request("DELETE", f"/pods/{pod_id}", api_key)
+    except RunPodAPIError as exc:
+        if exc.status_code != 404:
+            raise
+        logger.info("Pod %s already terminated (404 on DELETE)", pod_id)
 
 
 __all__ = [
