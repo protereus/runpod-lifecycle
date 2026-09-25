@@ -5,9 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import requests
-
-from .api import get_network_volumes
+from .api import get_network_volumes, update_network_volume_size
 
 logger = logging.getLogger("runpod_lifecycle.storage")
 
@@ -26,16 +24,8 @@ STORAGE_CHECK_COMMAND = """
 def _expand_network_volume(api_key: str, volume_id: str, size_gb: int) -> bool:
     """Expand a network volume to the requested size in GiB."""
     try:
-        response = requests.patch(
-            f"https://rest.runpod.io/v1/networkvolumes/{volume_id}",
-            json={"size": size_gb},
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=30,
-        )
-        return response.status_code == 200
+        update_network_volume_size(api_key, volume_id, size_gb)
+        return True
     except Exception as exc:
         logger.warning("Failed to expand network volume %s: %s", volume_id, exc)
         return False

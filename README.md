@@ -15,6 +15,22 @@ sibling checkout:
 pip install "runpod-lifecycle @ git+https://github.com/banodoco/runpod-lifecycle.git@v0.1.1"
 ```
 
+## RunPod API
+
+All RunPod calls go to the REST API v2 (`https://api.runpod.io/v2`) over
+`httpx`; the `runpod` Python SDK is no longer a dependency. RunPod retires
+REST v1 on 15 November 2026 and GraphQL in early 2027, and rate-limits both
+in the meantime. Requests rejected with `429` are retried after the
+`Retry-After` delay. Idempotent requests (GET, PATCH, DELETE) are also
+retried on `5xx` and connection errors. Pod creation is never retried on
+those, so a create cannot be billed twice. Failed calls raise
+`runpod_lifecycle.api.RunPodAPIError` with the response's `status_code`,
+`title` and `detail`.
+
+Pod status values follow v2: `PROVISIONING`, `STARTING`, `RUNNING`,
+`EXITED`, `ERROR`, `TERMINATED`. `get_pod_status()` returns the value as
+`status`, and also as `desired_status` and `actual_status` for older callers.
+
 ## Environment Variables
 
 `RunPodConfig.from_env()` reads these variables:
@@ -136,13 +152,18 @@ async def main():
 asyncio.run(main())
 ```
 
-Results are price-ranked; GPU types without current secure-cloud availability are dropped.
+Results are price-ranked. GPU types with no current stock in the chosen cloud
+are dropped. Each result has an `availability` level (`LOW`, `MEDIUM` or
+`HIGH`) and lists the datacenters with stock in `datacenters_available`. Pass
+`datacenter_ids=[...]` (CLI: `--datacenter-ids`) to keep only GPU types with
+stock in those datacenters. Stock can change between a probe and a launch, so
+use the results to order your candidates, not as a guarantee.
 
 ## Config Reference
 
 | field | env var | default | description |
 | --- | --- | --- | --- |
-| `api_key` | `RUNPOD_API_KEY` | required | RunPod API key used by all SDK and HTTP calls. |
+| `api_key` | `RUNPOD_API_KEY` | required | RunPod API key, sent as a Bearer token on every REST API v2 call. |
 | `gpu_type` | `RUNPOD_GPU_TYPE` | `NVIDIA GeForce RTX 4090` | Display name used by `find_gpu_type()` before pod creation. |
 | `worker_image` | `RUNPOD_WORKER_IMAGE` | `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` | Container image passed to RunPod at launch time. |
 | `template_id` | `RUNPOD_TEMPLATE_ID` | `runpod-torch-v240` | RunPod template identifier used when creating the pod. |

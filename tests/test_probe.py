@@ -17,40 +17,53 @@ if probe_module is None:  # pragma: no cover - first-time import.
     probe_module = importlib.import_module("runpod_lifecycle.probe")
 probe = probe_module.probe
 
+from runpod_lifecycle import api as api_module  # noqa: E402
+
 
 def _gpu(
     gpu_id: str,
     display: str,
     mem: int,
     price: float | None,
+    *,
+    availability: str | None = "HIGH",
+    datacenters: list[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
-    return {
+    """A GPU type in the v2 ``GET /v2/catalog/gpus?include=AVAILABILITY`` shape."""
+    if datacenters is None:
+        datacenters = [("EU-RO-1", availability or "NONE")]
+    entry: dict[str, Any] = {
         "id": gpu_id,
-        "displayName": display,
-        "memoryInGb": mem,
-        "secureCloud": True,
-        "communityCloud": False,
-        "lowestPrice": {"uninterruptablePrice": price} if price is not None else None,
+        "name": display,
+        "memory": mem,
+        "secure": True,
+        "community": True,
+        "price": {"secure": price, "community": (price or 0) * 0.8},
+        "maxCount": {"secure": 8, "community": 8},
+        "dataCenters": [{"id": dc, "name": dc, "availability": level} for dc, level in datacenters],
     }
+    if availability is not None:
+        entry["availability"] = availability
+    return entry
 
 
 def _patch_response(
     monkeypatch: pytest.MonkeyPatch, payload: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """Stub httpx.post used by probe._fetch_gpu_types; record the sent query."""
+    """Stub httpx.request used by the API layer; record the sent params."""
     captured: dict[str, Any] = {}
 
-    def fake_post(url: str, json: dict[str, Any], headers: dict[str, str], timeout: int):
+    def fake_request(method: str, url: str, **kwargs: Any):
+        captured["method"] = method
         captured["url"] = url
-        captured["json"] = json
-        captured["headers"] = headers
-        captured["timeout"] = timeout
+        captured["params"] = kwargs.get("params")
+        captured["headers"] = kwargs.get("headers")
         response = MagicMock()
         response.status_code = 200
-        response.json.return_value = {"data": {"gpuTypes": payload}}
+        response.json.return_value = {"gpus": payload}
         return response
 
-    monkeypatch.setattr(probe_module.httpx, "post", fake_post)
+    monkeypatch.setattr(api_module.httpx, "request", fake_request)
     return captured
 
 
@@ -131,14 +144,16 @@ async def test_probe_filters_by_max_price(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_probe_drops_entries_with_no_lowest_price(
+async def test_probe_drops_entries_with_no_stock_or_price(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_response(
         monkeypatch,
         [
             _gpu("NVIDIA RTX 6000 Ada Generation", "RTX 6000 Ada", 48, 0.77),
-            _gpu("NVIDIA H100 NVL", "H100 NVL", 94, None),  # no availability
+            _gpu("NVIDIA H100 NVL", "H100 NVL", 94, 2.5, availability="NONE"),
+            _gpu("NVIDIA H200", "H200", 141, 3.5, availability=None),
+            _gpu("NVIDIA L40S", "L40S", 48, None),
         ],
     )
     results = await probe(api_key="k", min_memory_gb=24)
@@ -163,53 +178,100 @@ async def test_probe_gpu_types_allowlist(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.asyncio
-async def test_probe_query_uses_secure_cloud_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_probe_requests_availability_for_selected_cloud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured = _patch_response(monkeypatch, [])
     await probe(api_key="k", require_secure_cloud=True)
-    assert "secureCloud: true" in captured["json"]["query"]
+    assert captured["method"] == "GET"
+    assert captured["url"] == "https://api.runpod.io/v2/catalog/gpus"
+    assert captured["params"] == {
+        "include": "AVAILABILITY",
+        "product": "POD",
+        "count": 1,
+        "cloud": "SECURE",
+    }
+    assert captured["headers"] == {"Authorization": "Bearer k"}
 
     captured2 = _patch_response(monkeypatch, [])
     await probe(api_key="k", require_secure_cloud=False)
-    assert "secureCloud: false" in captured2["json"]["query"]
+    assert captured2["params"]["cloud"] == "COMMUNITY"
 
 
 @pytest.mark.asyncio
-async def test_probe_includes_secure_cloud_and_datacenter_fields(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_probe_uses_price_for_selected_cloud(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_response(monkeypatch, [_gpu("NVIDIA A100 80GB PCIe", "A100 80GB", 80, 2.0)])
+
+    secure = await probe(api_key="k", require_secure_cloud=True)
+    community = await probe(api_key="k", require_secure_cloud=False)
+
+    assert secure[0]["price_per_hour"] == 2.0
+    assert secure[0]["secure_cloud"] is True
+    assert community[0]["price_per_hour"] == pytest.approx(1.6)
+    assert community[0]["secure_cloud"] is False
+
+
+@pytest.mark.asyncio
+async def test_probe_reports_datacenters_with_stock(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_response(
         monkeypatch,
-        [_gpu("NVIDIA RTX 6000 Ada Generation", "RTX 6000 Ada", 48, 0.77)],
+        [
+            _gpu(
+                "NVIDIA RTX 6000 Ada Generation",
+                "RTX 6000 Ada",
+                48,
+                0.77,
+                availability="MEDIUM",
+                datacenters=[("EU-RO-1", "HIGH"), ("US-KS-2", "NONE"), ("US-TX-3", "LOW")],
+            )
+        ],
     )
-    results = await probe(api_key="k", min_memory_gb=24, require_secure_cloud=True)
-    assert results[0]["secure_cloud"] is True
-    assert results[0]["datacenters_available"] == []
-    assert results[0]["memory_gb"] == 48
+    [result] = await probe(api_key="k", min_memory_gb=24)
+    assert result["availability"] == "MEDIUM"
+    assert result["datacenters_available"] == ["EU-RO-1", "US-TX-3"]
+    assert result["memory_gb"] == 48
 
 
 @pytest.mark.asyncio
-async def test_probe_raises_on_graphql_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_post(*args: Any, **kwargs: Any):
+async def test_probe_filters_by_datacenter_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_response(
+        monkeypatch,
+        [
+            _gpu("gpu-eu", "EU only", 48, 0.7, datacenters=[("EU-RO-1", "HIGH")]),
+            _gpu("gpu-us", "US only", 48, 0.8, datacenters=[("US-TX-3", "HIGH")]),
+            _gpu("gpu-both", "Both", 48, 0.9, datacenters=[("EU-RO-1", "LOW"), ("US-TX-3", "HIGH")]),
+        ],
+    )
+    results = await probe(api_key="k", min_memory_gb=24, datacenter_ids=["US-TX-3"])
+    assert [(r["gpu_type"], r["datacenters_available"]) for r in results] == [
+        ("US only", ["US-TX-3"]),
+        ("Both", ["US-TX-3"]),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_probe_raises_on_unexpected_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_request(*args: Any, **kwargs: Any):
         response = MagicMock()
         response.status_code = 200
-        response.json.return_value = {"errors": [{"message": "bad"}]}
+        response.json.return_value = {"unexpected": True}
         return response
 
-    monkeypatch.setattr(probe_module.httpx, "post", fake_post)
+    monkeypatch.setattr(api_module.httpx, "request", fake_request)
 
-    with pytest.raises(RuntimeError, match="errors"):
+    with pytest.raises(RuntimeError, match="unexpected payload"):
         await probe(api_key="k")
 
 
 @pytest.mark.asyncio
 async def test_probe_raises_on_http_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_post(*args: Any, **kwargs: Any):
+    def fake_request(*args: Any, **kwargs: Any):
         response = MagicMock()
-        response.status_code = 500
-        response.text = "internal error"
+        response.status_code = 401
+        response.json.return_value = {"title": "Unauthorized", "status": 401, "detail": "bad key"}
         return response
 
-    monkeypatch.setattr(probe_module.httpx, "post", fake_post)
+    monkeypatch.setattr(api_module.httpx, "request", fake_request)
 
-    with pytest.raises(RuntimeError, match="HTTP 500"):
+    with pytest.raises(RuntimeError, match="HTTP 401"):
         await probe(api_key="k")

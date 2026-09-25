@@ -1,94 +1,223 @@
-"""RunPod SDK and HTTP primitives for the standalone lifecycle package."""
+"""HTTP primitives for the RunPod REST API v2 (https://api.runpod.io/v2).
+
+Every call goes through :func:`_request`, which retries 429 responses using
+``Retry-After`` and retries idempotent methods on transport errors and 5xx.
+POST is never retried on 5xx or transport errors so a create cannot be billed
+twice.
+"""
 
 from __future__ import annotations
 
-import contextlib
-import io
 import logging
-import os
 import time
 from typing import Any, Callable, Sequence
 
 import httpx
-
-try:
-    import runpod
-except ImportError:  # pragma: no cover - exercised indirectly before deps install.
-    runpod = None  # type: ignore[assignment]
+from httpx import TransportError
 
 logger = logging.getLogger("runpod_lifecycle.api")
 
-GRAPHQL_URL = "https://api.runpod.io/graphql"
-NETWORK_VOLUMES_URL = "https://api.runpod.io/v1/networkvolumes"
+API_BASE_URL = "https://api.runpod.io/v2"
+
+DEFAULT_PORTS = "22/tcp,8888/http"
+# The runpod SDK mounted a pod's own persistent volume here whenever no
+# network volume was attached; kept for parity with pods launched pre-v2.
+PERSISTENT_VOLUME_MOUNT_PATH = "/runpod-volume"
+
+MAX_RETRIES = 4
+MAX_RETRY_DELAY_SECONDS = 60.0
+_IDEMPOTENT_METHODS = frozenset({"GET", "PUT", "PATCH", "DELETE"})
+
+_sleep = time.sleep
 
 
-def _get_runpod() -> Any:
-    if runpod is None:
-        raise RuntimeError("runpod package is required for RunPod API calls")
-    return runpod
+class RunPodAPIError(RuntimeError):
+    """A non-2xx response from the RunPod API, parsed from its RFC 9457 body."""
+
+    def __init__(
+        self,
+        method: str,
+        path: str,
+        status_code: int,
+        title: str | None,
+        detail: str | None,
+    ) -> None:
+        self.method = method
+        self.path = path
+        self.status_code = status_code
+        self.title = title
+        self.detail = detail
+        summary = ": ".join(part for part in (title, detail) if part) or "no error detail"
+        super().__init__(f"RunPod API {method} {path} failed: HTTP {status_code}: {summary}")
 
 
 def _auth_headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"}
 
 
+def _error_from_response(method: str, path: str, response: Any) -> RunPodAPIError:
+    title = detail = None
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        title = body.get("title")
+        detail = body.get("detail") or body.get("message") or body.get("error")
+    if detail is None:
+        text = getattr(response, "text", "") or ""
+        detail = text[:200] or None
+    return RunPodAPIError(method, path, response.status_code, title, detail)
+
+
+def _retry_delay(response: Any, attempt: int) -> float:
+    headers = getattr(response, "headers", None) or {}
+    retry_after = headers.get("Retry-After") if hasattr(headers, "get") else None
+    try:
+        delay = float(retry_after) if retry_after is not None else 2.0**attempt
+    except (TypeError, ValueError):
+        delay = 2.0**attempt
+    return max(0.0, min(delay, MAX_RETRY_DELAY_SECONDS))
+
+
+def _request(
+    method: str,
+    path: str,
+    api_key: str,
+    *,
+    json: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+    timeout: float = 30,
+) -> Any:
+    """Send one API request, retrying where safe, and return the 2xx response."""
+    url = f"{API_BASE_URL}{path}"
+    idempotent = method in _IDEMPOTENT_METHODS
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = httpx.request(
+                method,
+                url,
+                json=json,
+                params=params,
+                headers=_auth_headers(api_key),
+                timeout=timeout,
+            )
+        except TransportError as exc:
+            if idempotent and attempt < MAX_RETRIES:
+                logger.warning("RunPod API %s %s transport error (%s); retrying", method, path, exc)
+                _sleep(2.0**attempt)
+                continue
+            raise
+
+        status = response.status_code
+        retryable = status == 429 or (idempotent and status >= 500)
+        if retryable and attempt < MAX_RETRIES:
+            delay = _retry_delay(response, attempt)
+            logger.warning(
+                "RunPod API %s %s returned HTTP %d; retrying in %.1fs", method, path, status, delay
+            )
+            _sleep(delay)
+            continue
+        if 200 <= status < 300:
+            return response
+        raise _error_from_response(method, path, response)
+
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _paginate(path: str, api_key: str, key: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Follow ``pagination.nextCursor`` and return every item under ``key``."""
+    items: list[dict[str, Any]] = []
+    query = dict(params or {})
+    while True:
+        body = _request("GET", path, api_key, params=query).json()
+        page = body.get(key) if isinstance(body, dict) else None
+        items.extend(item for item in page or [] if isinstance(item, dict))
+        pagination = body.get("pagination") if isinstance(body, dict) else None
+        cursor = pagination.get("nextCursor") if isinstance(pagination, dict) else None
+        if not cursor or not pagination.get("hasNextPage", True):
+            return items
+        query = {**query, "cursor": cursor}
+
+
+# ---------------------------------------------------------------------------
+# Network volumes
+# ---------------------------------------------------------------------------
+
+
+def _normalize_volume(volume: dict[str, Any]) -> dict[str, Any]:
+    # v2 renamed dataCenterId -> dataCenter; keep the old key for callers.
+    normalized = dict(volume)
+    normalized.setdefault("dataCenterId", volume.get("dataCenter"))
+    return normalized
+
+
 def get_network_volumes(api_key: str) -> list[dict[str, Any]]:
-    """Return the account's RunPod network volumes."""
-    sdk = _get_runpod()
-    sdk.api_key = api_key
-
+    """Return the account's RunPod network volumes, or ``[]`` if the lookup fails."""
     try:
-        if hasattr(sdk, "get_network_volumes"):
-            volumes = sdk.get_network_volumes()
-            return volumes if isinstance(volumes, list) else []
+        body = _request("GET", "/network-volumes", api_key).json()
     except Exception as exc:
-        logger.warning("RunPod SDK get_network_volumes failed: %s", exc)
+        logger.warning("RunPod network volume lookup failed: %s", exc)
+        return []
+    volumes = body.get("networkVolumes") if isinstance(body, dict) else None
+    return [_normalize_volume(v) for v in volumes or [] if isinstance(v, dict)]
 
-    try:
-        response = httpx.get(NETWORK_VOLUMES_URL, headers=_auth_headers(api_key), timeout=30)
-        if response.status_code == 200:
-            data = response.json()
-            if isinstance(data, list):
-                return data
-    except Exception as exc:
-        logger.warning("RunPod REST network volume lookup failed: %s", exc)
 
-    query = """
-    query {
-      myself {
-        networkVolumes {
-          id
-          name
-          size
-          dataCenterId
-        }
-      }
-    }
+def create_network_volume(
+    api_key: str,
+    name: str,
+    size_gb: int,
+    datacenter_id: str,
+) -> dict[str, Any]:
+    """Create a RunPod network volume and return it.
+
+    POSTs ``{name, size, dataCenter}`` to ``/v2/network-volumes``.
     """
+    payload: dict[str, Any] = {
+        "name": name,
+        "size": size_gb,
+        "dataCenter": datacenter_id,
+    }
     try:
-        response = httpx.post(
-            GRAPHQL_URL,
-            json={"query": query},
-            headers=_auth_headers(api_key),
-            timeout=30,
-        )
-        if response.status_code == 200:
-            data = response.json()
-            return data.get("data", {}).get("myself", {}).get("networkVolumes", [])
-    except Exception as exc:
-        logger.warning("RunPod GraphQL network volume lookup failed: %s", exc)
+        response = _request("POST", "/network-volumes", api_key, json=payload)
+    except RunPodAPIError as exc:
+        logger.error("create_network_volume failed: %s", exc)
+        raise RuntimeError(f"Failed to create network volume '{name}': {exc}") from exc
+    return _normalize_volume(response.json())
 
-    logger.warning("Could not fetch network volumes from SDK, REST, or GraphQL")
-    return []
+
+def update_network_volume_size(api_key: str, volume_id: str, size_gb: int) -> dict[str, Any]:
+    """Grow a network volume to ``size_gb`` (RunPod cannot shrink volumes)."""
+    response = _request("PATCH", f"/network-volumes/{volume_id}", api_key, json={"size": size_gb})
+    return _normalize_volume(response.json())
+
+
+# ---------------------------------------------------------------------------
+# GPU catalogue
+# ---------------------------------------------------------------------------
+
+
+def _normalize_gpu_type(gpu: dict[str, Any]) -> dict[str, Any]:
+    # Pre-v2 callers read displayName / memoryInGb; v2 calls them name / memory.
+    normalized = dict(gpu)
+    normalized.setdefault("displayName", gpu.get("name"))
+    normalized.setdefault("memoryInGb", gpu.get("memory"))
+    return normalized
+
+
+def list_gpu_types(api_key: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Return the GPU catalogue from ``GET /v2/catalog/gpus``."""
+    body = _request("GET", "/catalog/gpus", api_key, params=params).json()
+    gpus = body.get("gpus") if isinstance(body, dict) else None
+    if not isinstance(gpus, list):
+        raise RuntimeError(f"RunPod GPU catalogue returned unexpected payload: {body!r}")
+    return [_normalize_gpu_type(g) for g in gpus if isinstance(g, dict)]
 
 
 def find_gpu_type(gpu_display_name: str, api_key: str) -> dict[str, Any] | None:
     """Find a GPU type by display name or ID."""
-    sdk = _get_runpod()
-    sdk.api_key = api_key
-
     try:
-        gpus = sdk.get_gpus()
+        gpus = list_gpu_types(api_key)
     except Exception as exc:
         logger.error("Error retrieving GPU list from RunPod: %s", exc)
         return None
@@ -97,6 +226,70 @@ def find_gpu_type(gpu_display_name: str, api_key: str) -> dict[str, Any] | None:
         if gpu_display_name in (gpu.get("displayName"), gpu.get("id")):
             return gpu
     return None
+
+
+# ---------------------------------------------------------------------------
+# Pods
+# ---------------------------------------------------------------------------
+
+
+def _parse_ports(ports: str) -> list[str]:
+    return [port.strip() for port in ports.split(",") if port.strip()]
+
+
+def _build_create_pod_body(
+    *,
+    gpu_type_id: str,
+    image_name: str,
+    name: str,
+    network_volume_id: str | None,
+    volume_mount_path: str,
+    disk_in_gb: int,
+    container_disk_in_gb: int,
+    public_key_string: str | None,
+    env_vars: dict[str, str] | None,
+    min_vcpu_count: int,
+    min_memory_in_gb: int,
+    template_id: str | None,
+    ports: str | None,
+) -> dict[str, Any]:
+    gpu: dict[str, Any] = {"id": gpu_type_id, "count": 1}
+    # One GPU per pod, so the per-GPU floors equal the old per-pod minimums.
+    if min_vcpu_count and min_vcpu_count > 0:
+        gpu["minVcpuCountPerGpu"] = min_vcpu_count
+    if min_memory_in_gb and min_memory_in_gb > 0:
+        gpu["minRamPerGpu"] = min_memory_in_gb
+
+    body: dict[str, Any] = {
+        "name": name,
+        "image": image_name,
+        "cloud": "SECURE",
+        "gpu": gpu,
+        "disk": container_disk_in_gb,
+        "ports": _parse_ports(ports or DEFAULT_PORTS),
+        "startSsh": True,
+    }
+
+    if template_id:
+        body["templateId"] = template_id
+
+    # v2 allows either a network mount or a persistent pod volume, not both.
+    if network_volume_id:
+        body["mounts"] = {"network": [{"volumeId": network_volume_id, "path": volume_mount_path}]}
+    elif disk_in_gb and disk_in_gb > 0:
+        body["mounts"] = {
+            "persistent": {"size": max(disk_in_gb, 10), "path": PERSISTENT_VOLUME_MOUNT_PATH}
+        }
+
+    pod_env: dict[str, str] = {}
+    if env_vars:
+        pod_env.update(env_vars)
+    if public_key_string:
+        pod_env["PUBLIC_KEY"] = public_key_string
+    if pod_env:
+        body["env"] = pod_env
+
+    return body
 
 
 def create_pod(
@@ -116,55 +309,32 @@ def create_pod(
     ports: str | None = None,
 ) -> dict[str, Any]:
     """Create a RunPod pod and return provision metadata immediately."""
-    sdk = _get_runpod()
-    sdk.api_key = api_key
+    body = _build_create_pod_body(
+        gpu_type_id=gpu_type_id,
+        image_name=image_name,
+        name=name,
+        network_volume_id=network_volume_id,
+        volume_mount_path=volume_mount_path,
+        disk_in_gb=disk_in_gb,
+        container_disk_in_gb=container_disk_in_gb,
+        public_key_string=public_key_string,
+        env_vars=env_vars,
+        min_vcpu_count=min_vcpu_count,
+        min_memory_in_gb=min_memory_in_gb,
+        template_id=template_id,
+        ports=ports,
+    )
+    pod = _request("POST", "/pods", api_key, json=body).json()
 
-    params: dict[str, Any] = {
-        "name": name,
-        "image_name": image_name,
-        "gpu_type_id": gpu_type_id,
-        "gpu_count": 1,
-        "cloud_type": "SECURE",
-        "volume_in_gb": disk_in_gb,
-        "container_disk_in_gb": container_disk_in_gb,
-        "min_vcpu_count": min_vcpu_count,
-        "min_memory_in_gb": min_memory_in_gb,
-        "ports": ports or "22/tcp,8888/http",
-        "network_volume_id": network_volume_id,
-    }
-
-    if template_id:
-        params["template_id"] = template_id
-
-    if network_volume_id:
-        params["volume_mount_path"] = volume_mount_path
-
-    pod_env: dict[str, str] = {}
-    if env_vars:
-        pod_env.update(env_vars)
-    if public_key_string:
-        pod_env["PUBLIC_KEY"] = public_key_string
-    if pod_env:
-        params["env"] = pod_env
-
-    sdk_stdout = io.StringIO()
-    with contextlib.redirect_stdout(sdk_stdout):
-        pod = sdk.create_pod(**params)
-    leaked_stdout = sdk_stdout.getvalue().strip()
-    if leaked_stdout:
-        logger.debug("RunPod SDK create_pod wrote %d bytes to stdout; suppressed to avoid leaking pod env", len(leaked_stdout))
-
-    pod_data = pod
-    if isinstance(pod, dict) and "data" in pod:
-        pod_data = pod.get("data", {}).get("podFindAndDeployOnDemand", {})
-
-    pod_id = pod_data.get("id") if isinstance(pod_data, dict) else None
+    pod_id = pod.get("id") if isinstance(pod, dict) else None
     if not pod_id:
         raise RuntimeError("Pod creation failed (no pod ID returned)")
 
+    status = pod.get("status") or "PROVISIONING"
     return {
         "id": pod_id,
-        "desiredStatus": "PROVISIONING",
+        "status": status,
+        "desiredStatus": status,
         "name": name,
         "gpu_type_id": gpu_type_id,
         "created": True,
@@ -178,9 +348,15 @@ _CAPACITY_ERROR_MARKERS = (
     "not enough capacity",
     "out of stock",
 )
+# v2 create-pod contract: 400 covers "this GPU/data centre could not be
+# placed" (no machine-readable capacity code yet) and 403 means the account
+# cannot use that pool. Both mean "try the next candidate".
+_CANDIDATE_MISS_STATUSES = frozenset({400, 403})
 
 
 def _is_capacity_error(exc: BaseException) -> bool:
+    if isinstance(exc, RunPodAPIError) and exc.status_code in _CANDIDATE_MISS_STATUSES:
+        return True
     message = str(exc).lower()
     return any(marker in message for marker in _CAPACITY_ERROR_MARKERS)
 
@@ -323,227 +499,121 @@ def create_pod_with_fallbacks(
     )
 
 
-def _normalize_pod_status(runpod_id: str, status: dict[str, Any]) -> dict[str, Any]:
-    runtime = status.get("runtime") if isinstance(status, dict) else None
+def _normalize_ports(raw_ports: Any) -> list[dict[str, Any]]:
+    """Map v2 ``runtime.ports`` entries onto the pre-v2 camelCase keys."""
+    ports: list[dict[str, Any]] = []
+    for port in raw_ports if isinstance(raw_ports, list) else []:
+        if not isinstance(port, dict):
+            continue
+        ports.append(
+            {
+                "ip": port.get("ip"),
+                "publicPort": port.get("public"),
+                "privatePort": port.get("private"),
+                "type": port.get("type"),
+            }
+        )
+    return ports
+
+
+def _direct_ssh(pod: dict[str, Any]) -> dict[str, Any] | None:
+    ssh = pod.get("ssh")
+    direct = ssh.get("direct") if isinstance(ssh, dict) else None
+    if isinstance(direct, dict) and direct.get("host") and direct.get("port"):
+        return direct
+    return None
+
+
+def _normalize_pod_status(runpod_id: str, pod: dict[str, Any]) -> dict[str, Any]:
+    runtime = pod.get("runtime")
     runtime = runtime if isinstance(runtime, dict) else {}
-    ports = runtime.get("ports", [])
-    ports = ports if isinstance(ports, list) else []
-    ip = runtime.get("ip") or next(
-        (port.get("ip") for port in ports if isinstance(port, dict) and port.get("ip")),
-        None,
-    )
+    ports = _normalize_ports(runtime.get("ports"))
+    direct = _direct_ssh(pod)
+    ip = (direct or {}).get("host") or next((p["ip"] for p in ports if p.get("ip")), None)
+    status = pod.get("status")
     return {
         "runpod_id": runpod_id,
-        "desired_status": status.get("desiredStatus"),
-        "actual_status": status.get("actualStatus"),
+        "status": status,
+        # v2 reports one lifecycle status; both legacy keys carry it.
+        "desired_status": status,
+        "actual_status": status,
         "ip": ip,
         "ports": ports,
-        "ssh_password": runtime.get("sshPassword"),
-        "created_at": status.get("createdAt"),
-        "last_status_change": status.get("lastStatusChange"),
-        "uptime_seconds": runtime.get("uptimeInSeconds", 0),
-        "cost_per_hr": status.get("costPerHr"),
+        "ssh_password": None,
+        "created_at": pod.get("createdAt"),
+        "started_at": pod.get("startedAt"),
+        "last_status_change": None,
+        "uptime_seconds": runtime.get("uptime") or 0,
+        "cost_per_hr": pod.get("cost"),
     }
 
 
-def _get_pod_status_graphql(runpod_id: str, api_key: str) -> dict[str, Any] | None:
-    queries = [
-        """
-        query PodStatus($podId: String!) {
-          pod(input: {podId: $podId}) {
-            id
-            desiredStatus
-            createdAt
-            lastStatusChange
-            costPerHr
-            runtime {
-              sshPassword
-              uptimeInSeconds
-              ports {
-                ip
-                publicPort
-                privatePort
-                type
-              }
-            }
-          }
-        }
-        """,
-        """
-        query PodStatus($podId: String!) {
-          pod(input: {podId: $podId}) {
-            id
-            desiredStatus
-            runtime {
-              ports {
-                ip
-                publicPort
-                privatePort
-                type
-              }
-            }
-          }
-        }
-        """,
-    ]
-    for query in queries:
-        try:
-            response = httpx.post(
-                GRAPHQL_URL,
-                json={"query": query, "variables": {"podId": runpod_id}},
-                headers=_auth_headers(api_key),
-                timeout=30,
-            )
-            if response.status_code != 200:
-                logger.warning(
-                    "GraphQL pod status lookup query failed for %s: %s",
-                    runpod_id,
-                    response.status_code,
-                )
-                continue
-
-            body = response.json()
-            if body.get("errors"):
-                continue
-
-            pod = body.get("data", {}).get("pod")
-            return _normalize_pod_status(runpod_id, pod) if isinstance(pod, dict) else None
-        except Exception as exc:
-            logger.warning("GraphQL pod status lookup failed for %s: %s", runpod_id, exc)
+def get_pod(runpod_id: str, api_key: str) -> dict[str, Any] | None:
+    """Return the raw v2 pod object, or ``None`` if the pod does not exist."""
+    try:
+        pod = _request("GET", f"/pods/{runpod_id}", api_key).json()
+    except RunPodAPIError as exc:
+        if exc.status_code == 404:
             return None
+        raise
+    return pod if isinstance(pod, dict) else None
 
-    logger.warning("GraphQL pod status lookup returned only errors for %s", runpod_id)
-    return None
+
+def list_pods(api_key: str) -> list[dict[str, Any]]:
+    """Return every standalone pod on the account as raw v2 pod objects."""
+    return _paginate("/pods", api_key, "pods")
 
 
 def get_pod_status(runpod_id: str, api_key: str) -> dict[str, Any] | None:
     """Return normalized pod status details using snake_case keys."""
     try:
-        sdk = _get_runpod()
-        sdk.api_key = api_key
-        status = sdk.get_pod(runpod_id)
-        if isinstance(status, dict) and status:
-            return _normalize_pod_status(runpod_id, status)
-        if status:
-            logger.warning("RunPod SDK returned unexpected pod status for %s: %r", runpod_id, status)
+        pod = get_pod(runpod_id, api_key)
     except Exception as exc:
-        logger.warning("RunPod SDK pod status lookup failed for %s: %s", runpod_id, exc)
-
-    return _get_pod_status_graphql(runpod_id, api_key)
+        logger.warning("RunPod pod status lookup failed for %s: %s", runpod_id, exc)
+        return None
+    return _normalize_pod_status(runpod_id, pod) if pod else None
 
 
 def get_pod_ssh_details(pod_id: str, api_key: str) -> dict[str, Any] | None:
     """Return SSH details (ip, port, password) for a running pod."""
-    sdk = _get_runpod()
-    sdk.api_key = api_key
-
     try:
-        status = sdk.get_pod(pod_id)
-        if isinstance(status, dict):
-            runtime = status.get("runtime", {})
-            if isinstance(runtime, dict):
-                for port_map in runtime.get("ports", []):
-                    if port_map.get("privatePort") == 22:
-                        return {
-                            "ip": port_map.get("ip"),
-                            "port": port_map.get("publicPort"),
-                            "password": runtime.get("sshPassword", "runpod"),
-                        }
+        pod = get_pod(pod_id, api_key)
     except Exception as exc:
-        logger.warning("RunPod SDK get_pod failed for %s: %s", pod_id, exc)
+        logger.warning("RunPod get pod failed for %s: %s", pod_id, exc)
+        pod = None
 
-    query = """
-    query PodSshDetails($podId: String!) {
-      pod(input: {podId: $podId}) {
-        id
-        desiredStatus
-        runtime {
-          ports {
-            ip
-            publicPort
-            privatePort
-            type
-          }
-        }
-      }
-    }
-    """
-    try:
-        response = httpx.post(
-            GRAPHQL_URL,
-            json={"query": query, "variables": {"podId": pod_id}},
-            headers=_auth_headers(api_key),
-            timeout=30,
-        )
-        if response.status_code == 200:
-            pod = response.json().get("data", {}).get("pod")
-            if isinstance(pod, dict):
-                runtime = pod.get("runtime", {})
-                if isinstance(runtime, dict):
-                    for port_map in runtime.get("ports", []):
-                        if port_map.get("privatePort") == 22:
-                            return {
-                                "ip": port_map.get("ip"),
-                                "port": port_map.get("publicPort"),
-                                "password": "runpod",
-                            }
-        else:
-            logger.warning("GraphQL API failed for pod %s: %s", pod_id, response.status_code)
-    except Exception as exc:
-        logger.warning("GraphQL fallback failed for pod %s: %s", pod_id, exc)
+    if pod:
+        direct = _direct_ssh(pod)
+        if direct:
+            return {"ip": direct["host"], "port": direct["port"], "password": "runpod"}
+        runtime = pod.get("runtime")
+        ports = _normalize_ports(runtime.get("ports") if isinstance(runtime, dict) else None)
+        for port_map in ports:
+            if port_map.get("privatePort") == 22 and port_map.get("ip") and port_map.get("publicPort"):
+                return {"ip": port_map["ip"], "port": port_map["publicPort"], "password": "runpod"}
 
-    logger.warning("Could not get SSH details for pod %s via SDK or GraphQL API", pod_id)
+    logger.warning("Could not get SSH details for pod %s via the RunPod API", pod_id)
     return None
 
 
 def terminate_pod(pod_id: str, api_key: str) -> None:
     """Terminate a RunPod pod to stop billing."""
-    sdk = _get_runpod()
-    sdk.api_key = api_key
-    sdk.terminate_pod(pod_id)
-
-
-def create_network_volume(
-    api_key: str,
-    name: str,
-    size_gb: int,
-    datacenter_id: str,
-) -> dict[str, Any]:
-    """Create a RunPod network volume via REST API.
-
-    POSTs to ``NETWORK_VOLUMES_URL`` with payload ``{name, size, dataCenterId}``.
-    Returns the full API response dict on success.
-    """
-    payload: dict[str, Any] = {
-        "name": name,
-        "size": size_gb,
-        "dataCenterId": datacenter_id,
-    }
-    response = httpx.post(
-        NETWORK_VOLUMES_URL,
-        json=payload,
-        headers=_auth_headers(api_key),
-        timeout=30,
-    )
-    if response.status_code not in (200, 201):
-        logger.error(
-            "create_network_volume failed: status=%d body=%s",
-            response.status_code,
-            response.text[:500],
-        )
-        raise RuntimeError(
-            f"Failed to create network volume '{name}': "
-            f"HTTP {response.status_code}: {response.text[:200]}"
-        )
-    return response.json()
+    _request("DELETE", f"/pods/{pod_id}", api_key)
 
 
 __all__ = [
+    "API_BASE_URL",
+    "RunPodAPIError",
     "create_pod",
+    "create_pod_with_fallbacks",
     "create_network_volume",
     "find_gpu_type",
     "get_network_volumes",
+    "get_pod",
     "get_pod_ssh_details",
     "get_pod_status",
+    "list_gpu_types",
+    "list_pods",
     "terminate_pod",
+    "update_network_volume_size",
 ]

@@ -178,13 +178,11 @@ async def _cmd_find_orphans(args: argparse.Namespace) -> int:
 
 async def _cmd_gpu_types(args: argparse.Namespace) -> int:
     api_key = _resolve_api_key(args)
-    sdk = api._get_runpod()
-    sdk.api_key = api_key
-    gpus = await asyncio.to_thread(sdk.get_gpus)
+    gpus = await asyncio.to_thread(api.list_gpu_types, api_key)
     if args.json:
         print(json.dumps(gpus, default=str, indent=2))
     else:
-        for g in gpus or []:
+        for g in gpus:
             print(f"{g.get('displayName','-')}  ({g.get('id','-')})")
     return 0
 
@@ -374,7 +372,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
     if not results:
         print("(no viable configurations)")
         return 0
-    headers = ["GPU TYPE", "MEM GB", "$/HR", "SECURE", "BLACKWELL"]
+    headers = ["GPU TYPE", "MEM GB", "$/HR", "SECURE", "BLACKWELL", "STOCK"]
     rows: list[list[str]] = []
     for r in results:
         rows.append([
@@ -383,6 +381,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
             f"${float(r.get('price_per_hour', 0.0)):.3f}",
             "yes" if r.get("secure_cloud") else "no",
             "yes" if r.get("is_blackwell") else "no",
+            str(r.get("availability") or "-"),
         ])
     _print_table(rows, headers)
     return 0
@@ -522,13 +521,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--container-disk-gb",
         type=int,
         default=100,
-        help="Container disk size used for forward-compatible availability checks.",
+        help="Accepted for backwards compatibility; not used by RunPod's availability data.",
     )
     p_probe.add_argument(
         "--datacenter-ids",
         dest="datacenter_ids",
-        help="Comma-separated datacenter id allow-list (forward-compatible; "
-        "currently informational only).",
+        help="Comma-separated datacenter id allow-list; only GPU types with "
+        "stock in one of these datacenters are returned.",
     )
     p_probe.add_argument(
         "--format",
