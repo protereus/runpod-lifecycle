@@ -1,9 +1,9 @@
 ---
 name: runpod-lifecycle
-description: Provision, manage, and tear down RunPod GPU instances from Python via the reusable `runpod_lifecycle` package (v0.3.0). The single source of truth for launching pods, waiting for readiness, SSH exec, shipping code + running it + collecting artifacts (`ship_and_run` / `ship_and_run_detached`), capacity probing, multi-GPU/multi-datacenter fan-out, orphan cleanup, and shutdown. Use whenever a tool, script, or agent needs ephemeral GPU compute on RunPod — model inference, training, batch jobs, benchmarks, live test/acceptance suites. ALSO use when the user asks to "spin up a RunPod / 4090 / A100", "shut down pod X", "list my pods", "run this on a GPU", or when extending a service that manages pods. Do not call the raw `runpod` SDK directly in new code — use this package.
+description: Provision, manage, and tear down RunPod GPU instances from Python via the reusable `runpod_lifecycle` package (v0.4.0). The single source of truth for launching pods, waiting for readiness, SSH exec, shipping code + running it + collecting artifacts (`ship_and_run` / `ship_and_run_detached`), capacity probing, multi-GPU/multi-datacenter fan-out, orphan cleanup, and shutdown. Use whenever a tool, script, or agent needs ephemeral GPU compute on RunPod — model inference, training, batch jobs, benchmarks, live test/acceptance suites. ALSO use when the user asks to "spin up a RunPod / 4090 / A100", "shut down pod X", "list my pods", "run this on a GPU", or when extending a service that manages pods. Do not call the raw `runpod` SDK directly in new code — use this package.
 ---
 
-# RunPod Lifecycle (v0.3.0)
+# RunPod Lifecycle (v0.4.0)
 
 Async RunPod lifecycle primitives — launch a pod, wait until SSH-ready, run commands, ship code + collect artifacts, monitor storage, discover/clean orphans, and terminate cleanly. No orchestrator-specific state; consumers attach `EventHooks` if they want persistence.
 
@@ -120,7 +120,9 @@ pod = await launch(cfg)             # raises LaunchFailure aggregating every fai
 
 **Wait for capacity** — `launch_when_available(config, max_wait_sec=, retry_interval_sec=)` retries the exact GPU×RAM×storage matrix for a bounded period (vs. `launch()`, which is one-shot). The detached runner does **not** self-retry on capacity — wrap it in a retry loop catching only `LaunchFailure` (real job failures return an exit code, not an exception).
 
-**Probe without launching** — `runpod-lifecycle probe --min-memory 48 --exclude-blackwell` (or `probe(...)` in Python) returns price-ranked launchable GPU types; creates no pod.
+**Probe without launching** — `runpod-lifecycle probe --min-memory 48 --exclude-blackwell` (or `probe(...)` in Python) returns price-ranked launchable GPU types; creates no pod. Each entry carries `availability` (`LOW`/`MEDIUM`/`HIGH`) and `datacenters_available`; `--datacenter-ids EU-RO-1,US-TX-3` keeps only GPUs with stock there.
+
+**RunPod API v2** — since v0.4.0 every call uses REST API v2 (`https://api.runpod.io/v2`) over `httpx`; the `runpod` SDK is no longer a dependency (REST v1 retires 15 Nov 2026, GraphQL early 2027). 429s are retried after `Retry-After`. Errors raise `api.RunPodAPIError` (`status_code`, `title`, `detail`). On create, a `400` or `403` counts as a capacity miss, so the fallback moves on to the next GPU/volume; `402` (insufficient balance) aborts. Pod status values are v2's: `PROVISIONING`, `STARTING`, `RUNNING`, `EXITED`, `ERROR`, `TERMINATED`.
 
 ## Discovery & orphan cleanup
 
@@ -156,7 +158,7 @@ runpod-lifecycle launch --gpu-type "A5000,L4,A40" --storage-volumes "Peter,EU-NO
 
 | field | env var | default | notes |
 |---|---|---|---|
-| `api_key` | `RUNPOD_API_KEY` | required | used by all SDK/HTTP calls |
+| `api_key` | `RUNPOD_API_KEY` | required | Bearer token for every REST API v2 call |
 | `gpu_type` | `RUNPOD_GPU_TYPE` | `NVIDIA GeForce RTX 4090` | display name or CSV/tuple of candidates |
 | `worker_image` | `RUNPOD_WORKER_IMAGE` | `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` | container image |
 | `template_id` | `RUNPOD_TEMPLATE_ID` | `runpod-torch-v240` | RunPod template |
@@ -187,4 +189,4 @@ If `storage_name` is unset and `storage_volumes` is empty, `launch()` creates a 
 
 ## Scope / extraction notes
 
-Extracted from `reigh-worker-orchestrator/gpu_orchestrator/runpod/` (RAM-tier fallback, dual SDK + GraphQL SSH-detail fetch, storage expansion, startup-script SSH injection). Behavior parity is the contract — file divergences as bugs against the package, not workarounds in callers. Does not include `startup_script.py`, `check_worker_startup_status`, or any persistence layer; use `EventHooks(on_state_change=..., on_error=...)` to persist state to your own store.
+Extracted from `reigh-worker-orchestrator/gpu_orchestrator/runpod/` (RAM-tier fallback, SSH-detail fetch (now via REST API v2), storage expansion, startup-script SSH injection). Behavior parity is the contract — file divergences as bugs against the package, not workarounds in callers. Does not include `startup_script.py`, `check_worker_startup_status`, or any persistence layer; use `EventHooks(on_state_change=..., on_error=...)` to persist state to your own store.

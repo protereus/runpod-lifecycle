@@ -2,9 +2,9 @@
 
 The :func:`probe` function answers the question "what configuration could
 actually launch right now, given my constraints?" — by querying RunPod's
-GraphQL ``gpuTypes`` schema and returning a price-ranked list of viable
-candidates. This avoids the trial-and-error provisioning loop where every
-failed attempt costs 20s+ of RAM-tier iteration.
+v2 GPU catalogue with live availability and returning a price-ranked list of
+viable candidates. This avoids the trial-and-error provisioning loop where
+every failed attempt costs 20s+ of RAM-tier iteration.
 """
 
 from __future__ import annotations
@@ -13,35 +13,9 @@ import asyncio
 import logging
 from typing import Any
 
-import httpx
-
-from .api import GRAPHQL_URL, _auth_headers
+from . import api
 
 logger = logging.getLogger("runpod_lifecycle.probe")
-
-# GraphQL query used by :func:`probe`. ``lowestPrice`` is parameterised at
-# request time because RunPod's schema expects a literal boolean rather than
-# a variable on the inner input object in some deployments.
-_PROBE_QUERY_TEMPLATE = """
-query GpuTypesProbe {
-  gpuTypes {
-    id
-    displayName
-    memoryInGb
-    secureCloud
-    communityCloud
-    lowestPrice(input: {gpuCount: 1, secureCloud: __SECURE__}) {
-      uninterruptablePrice
-    }
-  }
-}
-"""
-
-
-def _build_query(require_secure_cloud: bool) -> str:
-    return _PROBE_QUERY_TEMPLATE.replace(
-        "__SECURE__", "true" if require_secure_cloud else "false"
-    )
 
 
 def _is_blackwell(gpu_id: str | None, display_name: str | None) -> bool:
@@ -49,36 +23,20 @@ def _is_blackwell(gpu_id: str | None, display_name: str | None) -> bool:
     return "blackwell" in haystack
 
 
+def _cloud(require_secure_cloud: bool) -> str:
+    return "SECURE" if require_secure_cloud else "COMMUNITY"
+
+
 async def _fetch_gpu_types(
     api_key: str, require_secure_cloud: bool
 ) -> list[dict[str, Any]]:
-    query = _build_query(require_secure_cloud)
-
-    def _post() -> httpx.Response:
-        return httpx.post(
-            GRAPHQL_URL,
-            json={"query": query},
-            headers=_auth_headers(api_key),
-            timeout=30,
-        )
-
-    response = await asyncio.to_thread(_post)
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"RunPod GraphQL gpuTypes query failed: HTTP {response.status_code}: "
-            f"{response.text[:200]}"
-        )
-    body = response.json()
-    if body.get("errors"):
-        raise RuntimeError(
-            f"RunPod GraphQL gpuTypes query returned errors: {body['errors']}"
-        )
-    gpu_types = body.get("data", {}).get("gpuTypes") or []
-    if not isinstance(gpu_types, list):
-        raise RuntimeError(
-            f"RunPod GraphQL gpuTypes query returned unexpected payload: {body!r}"
-        )
-    return gpu_types
+    params = {
+        "include": "AVAILABILITY",
+        "product": "POD",
+        "count": 1,
+        "cloud": _cloud(require_secure_cloud),
+    }
+    return await asyncio.to_thread(api.list_gpu_types, api_key, params)
 
 
 async def probe(
@@ -102,58 +60,49 @@ async def probe(
           "price_per_hour": 0.77,
           "secure_cloud": True,
           "is_blackwell": False,
-          "datacenters_available": [],
+          "availability": "HIGH",
+          "datacenters_available": ["EU-RO-1", "US-KS-2"],
         }
 
     Parameters
     ----------
     api_key:
-        RunPod API key used for the GraphQL request.
+        RunPod API key used for the catalogue request.
     gpu_types:
         Optional allow-list of GPU type ``id`` values (case-sensitive).
         ``None`` means "consider every type RunPod returns".
     min_memory_gb:
-        Minimum VRAM (``memoryInGb`` from RunPod) the GPU must report.
+        Minimum VRAM (``memory`` from RunPod) the GPU must report.
     max_price_per_hour:
-        Optional cap on the hourly uninterruptable price.
+        Optional cap on the hourly on-demand price.
     require_secure_cloud:
-        When ``True`` the ``lowestPrice`` lookup restricts to Secure Cloud
-        instances (and the returned ``secure_cloud`` flag is always ``True``).
+        When ``True`` availability and price are for Secure Cloud; otherwise
+        Community Cloud. The returned ``secure_cloud`` flag mirrors it.
     exclude_blackwell:
         Filter out GPU types whose id/display name contains ``"Blackwell"``
         (case-insensitive). Banodoco hivemind reports a training-quality
         regression on Blackwell variants.
     container_disk_gb:
-        Reserved for the eventual datacenter-availability lookup; currently
-        unused but accepted for forward compatibility with the brief.
+        Accepted for backwards compatibility; RunPod's catalogue does not
+        scope availability by disk size, so it is unused.
     datacenter_ids:
-        Optional restriction list. The ``datacenters_available`` field is
-        returned as ``[]`` for now (TODO below); when this argument is set
-        and the field is empty we still return the entry so callers can rank
-        and try them — actual DC-level capacity must be inferred by attempting
-        to launch.
+        Optional restriction list. When set, only GPU types with stock in at
+        least one of these data centres are returned, and
+        ``datacenters_available`` is narrowed to them.
 
     Returns
     -------
     list[dict]
         Configurations sorted by ``price_per_hour`` ascending. GPU types with
-        no ``lowestPrice`` (i.e. no current availability under the
-        ``secureCloud`` flag requested) are filtered out.
-
-    Notes
-    -----
-    TODO: RunPod's public GraphQL schema does not expose a clean per-GPU
-    datacenter availability list. ``datacenters_available`` is therefore a
-    best-effort empty list ``[]`` for the first cut; a future revision can
-    fill it in once we settle on whether to scrape the ``Stockless``
-    detection endpoint or the ``dataCenters { compute }`` resolver (the
-    latter is admin-gated as of this writing).
+        no current stock (availability ``NONE`` or missing) in the requested
+        cloud are filtered out. Stock can change between probe and launch, so
+        treat the result as an ordering, not a reservation.
     """
-    # ``container_disk_gb`` and ``datacenter_ids`` accepted but unused for
-    # the first cut — see TODO above.
     del container_disk_gb
 
     raw = await _fetch_gpu_types(api_key, require_secure_cloud)
+    price_key = "secure" if require_secure_cloud else "community"
+    wanted_dcs: set[str] | None = set(datacenter_ids) if datacenter_ids else None
 
     gpu_type_allowlist: set[str] | None = (
         set(gpu_types) if gpu_types is not None else None
@@ -165,8 +114,8 @@ async def probe(
             continue
 
         gpu_id = entry.get("id")
-        display_name = entry.get("displayName")
-        memory_gb_raw = entry.get("memoryInGb")
+        display_name = entry.get("name")
+        memory_gb_raw = entry.get("memory")
         try:
             memory_gb = int(memory_gb_raw) if memory_gb_raw is not None else 0
         except (TypeError, ValueError):
@@ -182,18 +131,30 @@ async def probe(
         if exclude_blackwell and blackwell:
             continue
 
-        lowest = entry.get("lowestPrice") or {}
-        price_raw = lowest.get("uninterruptablePrice") if isinstance(lowest, dict) else None
-        if price_raw is None:
-            # No availability under the requested cloud flag — drop it.
+        availability = entry.get("availability")
+        if availability in (None, "NONE"):
             continue
+
+        prices = entry.get("price") if isinstance(entry.get("price"), dict) else {}
         try:
-            price = float(price_raw)
+            price = float(prices.get(price_key))
         except (TypeError, ValueError):
+            continue
+        if price <= 0:
             continue
 
         if max_price_per_hour is not None and price > max_price_per_hour:
             continue
+
+        datacenters = [
+            dc.get("id")
+            for dc in entry.get("dataCenters") or []
+            if isinstance(dc, dict) and dc.get("id") and dc.get("availability") not in (None, "NONE")
+        ]
+        if wanted_dcs is not None:
+            datacenters = [dc for dc in datacenters if dc in wanted_dcs]
+            if not datacenters:
+                continue
 
         results.append(
             {
@@ -202,17 +163,9 @@ async def probe(
                 "price_per_hour": price,
                 "secure_cloud": bool(require_secure_cloud),
                 "is_blackwell": blackwell,
-                "datacenters_available": [],  # TODO: see docstring.
+                "availability": availability,
+                "datacenters_available": datacenters,
             }
-        )
-
-    # ``datacenter_ids`` is accepted today purely as a no-op annotation; once
-    # availability data is plumbed through we will filter ``results`` by it.
-    if datacenter_ids:
-        logger.debug(
-            "probe: datacenter_ids=%s requested but availability data is not yet "
-            "plumbed; returning unfiltered results",
-            datacenter_ids,
         )
 
     results.sort(key=lambda r: r["price_per_hour"])

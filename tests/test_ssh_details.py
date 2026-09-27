@@ -9,60 +9,26 @@ import pytest
 from runpod_lifecycle.api import get_pod_ssh_details
 from runpod_lifecycle.config import RunPodConfig
 from runpod_lifecycle.pod import Pod
+from tests.conftest import FakeResponse, problem, v2_pod
 
 
-class FakeResponse:
-    def __init__(self, status_code: int, payload: dict):
-        self.status_code = status_code
-        self._payload = payload
-
-    def json(self) -> dict:
-        return self._payload
-
-
-def test_get_pod_ssh_details_uses_sdk_path_without_http(
-    monkeypatch: pytest.MonkeyPatch,
-    runpod_sdk_mock,
-) -> None:
-    runpod_sdk_mock.get_pod.return_value = {
-        "runtime": {
-            "sshPassword": "secret",
-            "ports": [
-                {"privatePort": 22, "publicPort": 2201, "ip": "1.2.3.4"},
-            ],
-        }
-    }
-    post_mock = SimpleNamespace(post=pytest.fail)
-    monkeypatch.setattr("runpod_lifecycle.api.httpx", post_mock)
+def test_get_pod_ssh_details_prefers_ssh_direct(runpod_api) -> None:
+    runpod_api.add(
+        "GET",
+        "/pods/pod-123",
+        FakeResponse(200, v2_pod("pod-123", ssh_direct={"host": "1.2.3.4", "port": 2201, "username": "root", "command": "ssh"})),
+    )
 
     details = get_pod_ssh_details("pod-123", "api-key")
 
-    assert details == {"ip": "1.2.3.4", "port": 2201, "password": "secret"}
+    assert details == {"ip": "1.2.3.4", "port": 2201, "password": "runpod"}
 
 
-def test_get_pod_ssh_details_falls_back_to_graphql(
-    monkeypatch: pytest.MonkeyPatch,
-    runpod_sdk_mock,
-) -> None:
-    runpod_sdk_mock.get_pod.return_value = {"runtime": {"ports": []}}
-    monkeypatch.setattr(
-        "runpod_lifecycle.api.httpx",
-        SimpleNamespace(
-            post=lambda *args, **kwargs: FakeResponse(
-                200,
-                {
-                    "data": {
-                        "pod": {
-                            "runtime": {
-                                "ports": [
-                                    {"privatePort": 22, "publicPort": 2202, "ip": "5.6.7.8"},
-                                ]
-                            }
-                        }
-                    }
-                },
-            )
-        ),
+def test_get_pod_ssh_details_falls_back_to_runtime_ports(runpod_api) -> None:
+    runpod_api.add(
+        "GET",
+        "/pods/pod-123",
+        FakeResponse(200, v2_pod("pod-123", ports=[{"private": 22, "public": 2202, "type": "tcp", "ip": "5.6.7.8"}])),
     )
 
     details = get_pod_ssh_details("pod-123", "api-key")
@@ -71,21 +37,22 @@ def test_get_pod_ssh_details_falls_back_to_graphql(
 
 
 def test_get_pod_ssh_details_returns_none_and_logs_warning(
-    monkeypatch: pytest.MonkeyPatch,
-    runpod_sdk_mock,
+    runpod_api,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.WARNING, logger="runpod_lifecycle.api")
-    runpod_sdk_mock.get_pod.return_value = {"runtime": {"ports": []}}
-    monkeypatch.setattr(
-        "runpod_lifecycle.api.httpx",
-        SimpleNamespace(post=lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom"))),
-    )
+    runpod_api.add("GET", "/pods/pod-123", FakeResponse(200, v2_pod("pod-123", ports=[])))
 
     details = get_pod_ssh_details("pod-123", "api-key")
 
     assert details is None
     assert "Could not get SSH details for pod pod-123" in caplog.text
+
+
+def test_get_pod_ssh_details_returns_none_when_api_fails(runpod_api) -> None:
+    runpod_api.add("GET", "/pods/pod-123", problem(401, "bad key"))
+
+    assert get_pod_ssh_details("pod-123", "api-key") is None
 
 
 def test_open_ssh_client_returns_connected_raw_client(monkeypatch: pytest.MonkeyPatch) -> None:

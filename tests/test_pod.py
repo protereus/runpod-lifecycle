@@ -125,13 +125,14 @@ def test_wait_ready_uses_normalized_status_keys(base_config, monkeypatch: pytest
     ]
 
 
-def test_wait_ready_raises_launch_failure_on_failed_status(
-    base_config, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("terminal_status", ["FAILED", "ERROR", "TERMINATED"])
+def test_wait_ready_raises_launch_failure_on_terminal_status(
+    base_config, monkeypatch: pytest.MonkeyPatch, terminal_status: str
 ) -> None:
     pod = Pod("pod-1", "worker", base_config)
 
     async def fake_status() -> dict[str, object]:
-        return {"desired_status": "FAILED", "ports": []}
+        return {"desired_status": terminal_status, "ports": []}
 
     monkeypatch.setattr(pod, "status", fake_status)
 

@@ -145,7 +145,7 @@ def test_launch_exhausted_fallback_emits_on_error_once(
 
 def test_launch_raises_before_create_when_gpu_missing(
     base_config,
-    runpod_sdk_mock,
+    runpod_api,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("runpod_lifecycle.lifecycle.find_gpu_type", lambda gpu_type, api_key: None)
@@ -153,7 +153,7 @@ def test_launch_raises_before_create_when_gpu_missing(
     with pytest.raises(LaunchFailure):
         asyncio.run(launch(base_config, name="missing-gpu"))
 
-    assert runpod_sdk_mock.create_pod.call_count == 0
+    assert runpod_api.calls_to("POST", "/pods") == []
 
 
 def test_launch_accepts_single_string_gpu_type(

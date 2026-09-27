@@ -33,32 +33,32 @@ class PodSummary:
 
 def _to_summary(raw: dict[str, Any]) -> PodSummary:
     runtime = raw.get("runtime") if isinstance(raw.get("runtime"), dict) else {}
-    machine = raw.get("machine") if isinstance(raw.get("machine"), dict) else {}
-    cost = raw.get("costPerHr")
+    gpu = raw.get("gpu") if isinstance(raw.get("gpu"), dict) else {}
+    mounts = raw.get("mounts") if isinstance(raw.get("mounts"), dict) else {}
+    network = [m for m in mounts.get("network") or [] if isinstance(m, dict)]
+    cost = raw.get("cost")
     try:
         cost_val = float(cost) if cost is not None else 0.0
     except (TypeError, ValueError):
         cost_val = 0.0
+    status = raw.get("status")
     return PodSummary(
         id=str(raw.get("id") or ""),
         name=raw.get("name"),
-        desired_status=raw.get("desiredStatus"),
-        actual_status=raw.get("actualStatus"),
-        gpu_type=raw.get("machineType") or machine.get("gpuDisplayName") or machine.get("gpuTypeId"),
-        image=raw.get("imageName"),
+        desired_status=status,
+        actual_status=status,
+        gpu_type=gpu.get("id"),
+        image=raw.get("image"),
         created_at=raw.get("createdAt"),
         cost_per_hr=cost_val,
-        uptime_seconds=runtime.get("uptimeInSeconds") if runtime else None,
-        ports=runtime.get("ports", []) if runtime else [],
-        network_volume_id=raw.get("networkVolumeId"),
+        uptime_seconds=runtime.get("uptime") if runtime else None,
+        ports=api._normalize_ports(runtime.get("ports")) if runtime else [],
+        network_volume_id=network[0].get("volumeId") if network else None,
     )
 
 
 def _list_pods_sync(api_key: str) -> list[dict[str, Any]]:
-    sdk = api._get_runpod()
-    sdk.api_key = api_key
-    pods = sdk.get_pods()
-    return list(pods) if pods else []
+    return api.list_pods(api_key)
 
 
 async def list_pods(api_key: str, *, name_prefix: str | None = None) -> list[PodSummary]:
@@ -81,7 +81,7 @@ async def find_pods(
     return [s for s in summaries if predicate(s)]
 
 
-_ACTIVE_STATUSES = {"RUNNING", "PROVISIONING"}
+_ACTIVE_STATUSES = {"RUNNING", "PROVISIONING", "STARTING"}
 
 
 async def find_orphans(

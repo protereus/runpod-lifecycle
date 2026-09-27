@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +11,7 @@ from runpod_lifecycle.storage import (
     evaluate_storage_health,
     parse_df_output,
 )
+from tests.conftest import FakeResponse, problem
 
 
 def test_parse_df_output_basic_workspace_line() -> None:
@@ -37,26 +37,23 @@ Filesystem      Size  Used Avail Use% Mounted on
     assert parse_df_output(raw_output)["total_gb"] == 1024
 
 
-def test_expand_network_volume_uses_patch_contract(monkeypatch: pytest.MonkeyPatch) -> None:
-    requests_seen: list[dict[str, object]] = []
-
-    def fake_patch(url: str, json: dict[str, int], headers: dict[str, str], timeout: int):
-        requests_seen.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
-        return SimpleNamespace(status_code=200)
-
-    monkeypatch.setattr("runpod_lifecycle.storage.requests.patch", fake_patch)
+def test_expand_network_volume_uses_v2_patch(runpod_api) -> None:
+    runpod_api.add(
+        "PATCH",
+        "/network-volumes/volume-1",
+        FakeResponse(200, {"id": "volume-1", "name": "v", "size": 150, "dataCenter": "EU-RO-1", "type": "STANDARD"}),
+    )
 
     assert _expand_network_volume("api-key", "volume-1", 150) is True
 
-    seen = requests_seen[0]
-    assert seen["url"] == "https://rest.runpod.io/v1/networkvolumes/volume-1"
-    assert seen["json"] == {"size": 150}
-    assert seen["headers"]["Authorization"] == "Bearer api-key"
+    call = runpod_api.calls_to("PATCH", "/network-volumes/volume-1")[0]
+    assert call.json == {"size": 150}
+    assert call.headers["Authorization"] == "Bearer api-key"
 
-    monkeypatch.setattr(
-        "runpod_lifecycle.storage.requests.patch",
-        lambda *args, **kwargs: SimpleNamespace(status_code=500),
-    )
+
+def test_expand_network_volume_returns_false_on_error(runpod_api) -> None:
+    runpod_api.add("PATCH", "/network-volumes/volume-1", problem(400, "size decrease attempted"))
+
     assert _expand_network_volume("api-key", "volume-1", 150) is False
 
 
